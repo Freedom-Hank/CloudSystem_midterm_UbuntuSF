@@ -13,10 +13,10 @@ cls
 echo ==========================================
 echo   Vortex P2P  Demo Launcher
 echo ==========================================
-echo   [1] 執行自動化腳本 (start_demo.sh)
-echo   [2] 開啟 6 個瀏覽器分頁查看節點
-echo   [3] 清除所有交易紀錄
-echo   [0] 離開
+echo   [1] Run start_demo.sh
+echo   [2] Open 6 browser tabs (localhost + 100.122.78.117)
+echo   [3] Clear transaction logs (storage/client*/*.txt)
+echo   [0] Quit
 echo ==========================================
 set "choice="
 set /p "choice=Choose (0-3): "
@@ -51,7 +51,7 @@ if !errorlevel! == 0 (
     wsl bash ./start_demo.sh
     goto run_done
 )
-echo [錯誤] 找不到可用的 bash。請安裝 Git for Windows 或設定一個正常的 WSL distro（例如 Ubuntu）。
+echo [error] no usable bash found. Install Git for Windows or set up a real WSL distro (e.g. Ubuntu).
 :run_done
 echo.
 pause
