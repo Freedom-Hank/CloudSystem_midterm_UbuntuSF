@@ -18,13 +18,11 @@ python3 auto_tx.py
 
 cat <<EOF
 
-Done. 從你的實體機瀏覽器連入：
+完成，節點瀏覽器網址：
   Client 1  http://${HOST_IP}:8081
   Client 2  http://${HOST_IP}:8082
   Client 3  http://${HOST_IP}:8083
-
-常用指令：
-  docker-compose logs -f          # 追蹤三個節點 log
-  docker exec -it client2 bash    # 進 client2 做竄改測試
-  docker-compose down             # 收掉整個環境
+  Client 4  http://100.122.78.117:8083
+  Client 5  http://100.122.78.117:8083
+  Client 6  http://100.122.78.117:8083
 EOF
