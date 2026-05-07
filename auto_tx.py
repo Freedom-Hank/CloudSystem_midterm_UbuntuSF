@@ -37,21 +37,21 @@ for user in USERS:
     payload = json.dumps({
         "sender": "SYSTEM",     # 特權帳號，繞過餘額檢查
         "receiver": user,
-        "amount": 50000          # 既然人少，每人發 50000 讓大家財富自由
+        "amount": 50000          # 既然人少，每人普發 50000
     }).encode('utf-8')
     
     req = urllib.request.Request(URL, data=payload, headers={'Content-Type': 'application/json'})
     
     try:
         with urllib.request.urlopen(req, timeout=3) as response:
-            print(f"💰 [SYSTEM] -> {user:<8} $50000 ✅")
+            print(f"[SYSTEM] -> {user:<8} $50000 ✅")
     except Exception as e:
         print(f"⚠️ {user} 發送失敗: {e}")
     
     time.sleep(0.1) # 給節點一點緩衝時間
 
 print("-" * 50)
-print("✨ 發錢完畢！現在開始跑 100 筆隨機交易...")
+print("SYSTEM 初始金額發放完畢，現在開始跑 100 筆隨機交易...")
 
 success_count = 0
 fail_count = 0
@@ -86,7 +86,6 @@ for i in range(1, 101):
     time.sleep(0.05)
 
 print("\n" + "=" * 50)
-print(f"📊 結果統計：成功 {success_count} 筆 / 失敗 {fail_count} 筆")
-print(f"📦 預期區塊數: {success_count // 5} 個完整區塊 + {success_count % 5} 筆在最新區塊")
-print("✅ 請至 Web GUI 或 /storage 目錄檢查是否成功產生約 20 個帳本區塊。")
+print(f"結果統計：成功 {success_count} 筆 / 失敗 {fail_count} 筆")
+print(f"預期區塊數: {success_count // 5} 個完整區塊 + {success_count % 5} 筆在最新區塊")
 print("=" * 50)
