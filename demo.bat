@@ -1,6 +1,8 @@
-﻿@echo off
-rem Windows 端的 demo 控制台。把工作目錄切到 .bat 所在資料夾，
-rem 之後不論從哪裡按兩下都不會找錯路徑。
+@echo off
+rem Demo console for Windows / Docker Desktop.
+rem Menu strings are kept ASCII on purpose: cmd.exe parses .bat files using
+rem the system ANSI codepage (cp950 on zh-TW), which mangles UTF-8 Chinese
+rem and turns parts of lines into bogus commands.
 chcp 65001 >nul
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
@@ -11,13 +13,13 @@ cls
 echo ==========================================
 echo   Vortex P2P  Demo Launcher
 echo ==========================================
-echo   [1] 執行自動化腳本 (start_demo.sh)
-echo   [2] 清除所有交易紀錄
-echo   [3] 開啟 6 個瀏覽器分頁查看節點
-echo   [0] 離開
+echo   [1] Run start_demo.sh
+echo   [2] Clear transaction logs (storage/client*/*.txt)
+echo   [3] Open 6 browser tabs (localhost + 100.122.78.117)
+echo   [0] Quit
 echo ==========================================
 set "choice="
-set /p "choice=請選擇 (0-3): "
+set /p "choice=Choose (0-3): "
 
 if "%choice%"=="1" goto run_demo
 if "%choice%"=="2" goto clear_tx
@@ -38,7 +40,7 @@ if !errorlevel! == 0 (
     bash start_demo.sh
     goto run_done
 )
-echo [錯誤] 找不到 wsl 或 bash，請先安裝 WSL2 或 Git Bash。
+echo [error] neither wsl nor bash found. Install WSL2 or Git Bash first.
 :run_done
 echo.
 pause
@@ -46,7 +48,7 @@ goto menu
 
 :clear_tx
 echo.
-echo --- 清除 storage\client{1,2,3}\*.txt ---
+echo --- clearing storage\client{1,2,3}\*.txt ---
 del /Q ".\storage\client1\*.txt" 2>nul
 del /Q ".\storage\client2\*.txt" 2>nul
 del /Q ".\storage\client3\*.txt" 2>nul
@@ -57,7 +59,7 @@ goto menu
 
 :open_browsers
 echo.
-echo --- 開啟 6 個瀏覽器分頁 ---
+echo --- opening 6 browser tabs ---
 start "" "http://localhost:8081"
 start "" "http://localhost:8082"
 start "" "http://localhost:8083"
