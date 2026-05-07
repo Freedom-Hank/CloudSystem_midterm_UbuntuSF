@@ -1,6 +1,8 @@
 @echo off
-rem Windows 端的 demo 控制台。把工作目錄切到 .bat 所在資料夾，
-rem 之後不論從哪裡按兩下都不會找錯路徑。
+rem Demo console for Windows / Docker Desktop.
+rem Menu strings are kept ASCII on purpose: cmd.exe parses .bat files using
+rem the system ANSI codepage (cp950 on zh-TW), which mangles UTF-8 Chinese
+rem and turns parts of lines into bogus commands.
 chcp 65001 >nul
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
@@ -17,7 +19,7 @@ echo   [3] 清除所有交易紀錄
 echo   [0] 離開
 echo ==========================================
 set "choice="
-set /p "choice=請選擇 (0-3): "
+set /p "choice=Choose (0-3): "
 
 if "%choice%"=="1" goto run_demo
 if "%choice%"=="2" goto open_browsers
@@ -57,7 +59,7 @@ goto menu
 
 :clear_tx
 echo.
-echo --- 清除 storage\client{1,2,3}\*.txt ---
+echo --- clearing storage\client{1,2,3}\*.txt ---
 del /Q ".\storage\client1\*.txt" 2>nul
 del /Q ".\storage\client2\*.txt" 2>nul
 del /Q ".\storage\client3\*.txt" 2>nul
@@ -68,7 +70,7 @@ goto menu
 
 :open_browsers
 echo.
-echo --- 開啟 6 個瀏覽器分頁 ---
+echo --- opening 6 browser tabs ---
 start "" "http://localhost:8081"
 start "" "http://localhost:8082"
 start "" "http://localhost:8083"
