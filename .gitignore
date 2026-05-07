@@ -10,3 +10,6 @@ __pycache__/
 
 # 忽略系統暫存檔
 .DS_Store
+
+# 忽略 claude 追蹤檔
+.claude
