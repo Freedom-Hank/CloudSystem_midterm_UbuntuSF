@@ -30,10 +30,6 @@ goto menu
 :run_demo
 echo.
 echo --- start_demo.sh ---
-rem 找一個真正能用的 bash。不要依賴 `where bash`：Windows 自帶
-rem System32\bash.exe 只是 WSL 啟動器，遇到 Docker Desktop 的
-rem "docker-desktop" distro（常常是預設）會炸 "/bin/bash: No such file"。
-rem 所以先掃 Git Bash 的已知路徑。
 set "GITBASH="
 if exist "%ProgramFiles%\Git\bin\bash.exe"        set "GITBASH=%ProgramFiles%\Git\bin\bash.exe"
 if not defined GITBASH if exist "%ProgramFiles%\Git\usr\bin\bash.exe"     set "GITBASH=%ProgramFiles%\Git\usr\bin\bash.exe"
@@ -45,7 +41,6 @@ if defined GITBASH (
 )
 where wsl >nul 2>nul
 if !errorlevel! == 0 (
-    rem 先試 Ubuntu，找不到再回退到預設 distro。
     wsl -d Ubuntu -- bash ./start_demo.sh 2>nul
     if !errorlevel! == 0 goto run_done
     wsl bash ./start_demo.sh
