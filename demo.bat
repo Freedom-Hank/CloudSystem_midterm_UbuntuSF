@@ -1,4 +1,4 @@
-@echo off
+﻿@echo off
 rem Windows 端的 demo 控制台。把工作目錄切到 .bat 所在資料夾，
 rem 之後不論從哪裡按兩下都不會找錯路徑。
 chcp 65001 >nul
