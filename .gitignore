@@ -9,4 +9,4 @@ __pycache__/
 .env
 
 # 忽略系統暫存檔
-.DS_Store
+.DS_Store.claude/
