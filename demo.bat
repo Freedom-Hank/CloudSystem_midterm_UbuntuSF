@@ -58,6 +58,8 @@ echo --- clearing storage\client{1,2,3}\*.txt ---
 del /Q ".\storage\client1\*.txt" 2>nul
 del /Q ".\storage\client2\*.txt" 2>nul
 del /Q ".\storage\client3\*.txt" 2>nul
+echo --- stopping and removing containers ---
+docker-compose down
 echo done.
 echo.
 pause
