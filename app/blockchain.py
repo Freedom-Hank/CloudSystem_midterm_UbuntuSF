@@ -64,7 +64,7 @@ class P2PNode:
             self.log_buffer.append(msg)
 
     def start(self):
-        print(f"📡 P2P Listener starting at {self.ip}:{self.port}")
+        print(f"[P2P] Listener {self.ip}:{self.port}")
         threading.Thread(target=self._listen, daemon=True).start()
         threading.Thread(target=self._heartbeat_loop, daemon=True).start()
 
@@ -118,7 +118,7 @@ class P2PNode:
                         initiator_id = parts[2]
                         self.network_trusted = False
                         self.network_trusted_reason = f"來自 {initiator_id} 的全網共識失敗通知（{reason}）"
-                        self.add_log(f"[共識機制] 🔒 收到 {initiator_id} 的凍結通知：{reason}")
+                        self.add_log(f"[共識] 收到 {initiator_id} 凍結通知\n原因: {reason}")
                     continue
 
                 if message.startswith("BROADCAST_TRUST:"):
@@ -130,7 +130,7 @@ class P2PNode:
                         self.network_trusted = True
                         self.network_trusted_reason = ""
                         if was_frozen:
-                            self.add_log(f"[共識機制] ✅ 收到 {initiator_id} 的全網解凍通知，本機已恢復信任。")
+                            self.add_log(f"[共識] 收到 {initiator_id} 解凍通知\n本機已恢復信任")
                     continue
 
                 if message.startswith("PING:"):
@@ -156,10 +156,10 @@ class P2PNode:
                     parts = message.split(":")
                     if len(parts) == 4:
                         self._execute_transaction(parts[1], parts[2], parts[3])
-                        self.add_log(f"[網路同步] 收到廣播交易: {parts[1]} 轉給 {parts[2]} {parts[3]} 元")
+                        self.add_log(f"[同步] 收到交易\n{parts[1]} -> {parts[2]} ({parts[3]})")
                     
                 elif message.startswith("REQ_HASH"):
-                    self.add_log(f"[跨節點驗證] 收到來自 {addr[0]} 的 Hash 請求，已回傳驗證結果。")
+                    self.add_log(f"[共識] 回應 Hash 請求 ({addr[0]})")
                     # 組合格式：RESP_HASH : [Hash] : [我的ID] : [安全Token]
                     response = f"RESP_HASH:{self._get_last_block_hash()}:{self.node_id}:{self.network_token}"
                     self.sock.sendto(response.encode('utf-8'), addr)
@@ -195,25 +195,25 @@ class P2PNode:
                         elif my_hash != majority_hash:
                             if provider_id in self.nodes_contact_book:
                                 provider_addr = self.nodes_contact_book[provider_id]
-                                self.add_log(f"[共識機制] ❌ 警告：本地帳本與全網共識不符！\n正在向信任節點 {provider_id} 請求修復...")
+                                self.add_log(f"[共識] 本地與多數派不符\n向 {provider_id} 請求修復")
                                 self.pending_initiator = initiator_id  # 新增：記住誰發起的，修完要回報
                                 self.sock.sendto(b"REQ_SYNC", provider_addr)
                             else:
-                                self.add_log(f"[共識機制] ⚠️ 收到廣播但找不到提供者 {provider_id} 的通訊錄地址。")
+                                self.add_log(f"[共識] 找不到提供者 {provider_id} 的位址")
 
                 elif message.startswith("REQ_SYNC"):
                     last_hash = self._get_last_block_hash()
                     if last_hash in ["INVALID", "EMPTY"]:
-                        self.add_log(f"[SYNC] Reject sync request from {addr[0]} because local ledger is {last_hash}.")
+                        self.add_log(f"[同步] 拒絕 {addr[0]} 的同步請求\n本地狀態: {last_hash}")
                         continue
-                    self.add_log(f"[共識機制] 收到來自 {addr[0]} 的修復請求，正在傳送正確帳本資料...")
+                    self.add_log(f"[同步] 回應 {addr[0]} 的修復請求")
                     ledger_data = self._pack_ledger()
                     self.sock.sendto(f"RESP_SYNC:{ledger_data}".encode('utf-8'), addr)
 
                 elif message.startswith("RESP_SYNC:"):
                     json_str = message[len("RESP_SYNC:"):]
                     self._unpack_and_repair_ledger(json_str)
-                    self.add_log("🎉 [共識機制] 置換完成！本地帳本已成功依照 >50% 多數決共識修復！")
+                    self.add_log("[同步] 本地帳本已修復完成")
                     # 新增：把修復完成的事實回報給當初發起 checkAllChains 的節點
                     initiator_id = getattr(self, "pending_initiator", None)
                     if initiator_id and initiator_id in self.nodes_contact_book:
@@ -225,7 +225,7 @@ class P2PNode:
 
                 elif message.startswith("REPAIR_DONE:"):
                     repaired_id = message.split(":", 1)[1]
-                    self.add_log(f"[共識機制] ✅ 確認節點 {repaired_id} 已完成帳本修復")
+                    self.add_log(f"[共識] 節點 {repaired_id} 修復完成")
 
             except Exception as e:
                 print(f"[Error] 監聽發生錯誤: {e}")
@@ -275,7 +275,32 @@ class P2PNode:
     def _check_chain_unlocked(self, initialize_missing_head=True):
         files = self._ledger_files_unlocked()
         if not files:
-            return True, "沒有帳本區塊"
+            # 區別「全新節點 (genesis)」與「區塊被刪除」：
+            #   - 連 latest_hash.txt 都沒有  → 全新節點，視為合法（讓首筆交易能寫入）
+            #   - latest_hash.txt 仍存在     → 代表曾經有帳本後被破壞，視為異常
+            if os.path.exists(HEAD_HASH_FILE):
+                return False, "所有帳本區塊遺失（latest_hash.txt 仍存在）"
+            return True, "全新節點，無帳本區塊"
+
+        # 完整性檢查：區塊編號必須是 1..N 連續、無跳號、無遺失前段
+        actual_ids = [int(f.split('.')[0]) for f in files]
+        expected_ids = list(range(1, len(files) + 1))
+        if actual_ids != expected_ids:
+            missing = sorted(set(expected_ids) - set(actual_ids))
+            extra = sorted(set(actual_ids) - set(expected_ids))
+            detail = []
+            if missing:
+                detail.append(f"缺漏: {missing[:5]}{'...' if len(missing) > 5 else ''}")
+            if extra:
+                detail.append(f"多餘: {extra[:5]}{'...' if len(extra) > 5 else ''}")
+            return False, f"區塊編號不連續 ({', '.join(detail)})"
+
+        # 創世檢查：第一個區塊的 prev_hash 必須是 "0"
+        first_path = os.path.join(STORAGE_PATH, files[0])
+        with open(first_path, "r") as f:
+            first_prev = f.readline().strip().replace("Sha256 of previous block: ", "")
+        if first_prev != "0":
+            return False, "創世區塊 1.txt 的 prev_hash 不是 0"
 
         for i in range(1, len(files)):
             prev_path = os.path.join(STORAGE_PATH, files[i - 1])
@@ -370,7 +395,7 @@ class P2PNode:
                 self.sock.sendto(msg.encode('utf-8'), peer)
             except Exception as e:
                 print(f"[Broadcast Distrust] 發送給 {peer} 失敗: {e}")
-        self.add_log(f"[共識機制] 🔒 已向全網廣播凍結通知（{reason}）")
+        self.add_log(f"[共識] 已廣播凍結通知\n原因: {reason}")
 
     def _broadcast_trust(self, live_peers):
         """共識成功且本機在多數派時，通知所有存活節點同步解凍。"""
@@ -380,15 +405,15 @@ class P2PNode:
                 self.sock.sendto(msg.encode('utf-8'), peer)
             except Exception as e:
                 print(f"[Broadcast Trust] 發送給 {peer} 失敗: {e}")
-        self.add_log(f"[共識機制] ✅ 已向全網廣播解凍通知")
+        self.add_log("[共識] 已廣播解凍通知")
 
     def _require_network_trust(self, action_name):
         """全網共識失敗時，凍結所有金流相關操作。回傳 (ok, msg)。"""
         if not self.network_trusted:
             msg = (
-                f"⚠️ {action_name}已凍結：上次全網共識失敗"
-                f"（原因：{self.network_trusted_reason}）。"
-                f"請重新發起全網共識驗證以恢復信任。"
+                f"{action_name}已凍結\n"
+                f"原因: {self.network_trusted_reason}\n"
+                f"請重新發起全網共識驗證"
             )
             self.add_log(msg)
             return False, msg
@@ -402,7 +427,7 @@ class P2PNode:
         is_valid = self._execute_checkChain()
         if not is_valid:
             # 如果帳本損毀，直接報錯或回傳 None，不進行後續計算
-            self.add_log(f"⚠️ [安全警示] 拒絕查詢餘額：本地帳本已受損，請先進行共識修復！")
+            self.add_log("[安全] 拒絕查詢餘額\n本地帳本受損，請先進行共識修復")
             return None # 或是回傳 0，視你的前端邏輯而定
         
         balance = 0
@@ -470,7 +495,7 @@ class P2PNode:
                 for filename, content in ledger_dict.items():
                     with open(os.path.join(STORAGE_PATH, filename), "w") as f: f.write(content)
                 self._write_head_hash_unlocked()
-                self.add_log("[自我修復] 完成，本地帳本已被 provider 覆寫並更新 latest_hash.txt")
+                self.add_log("[同步] 本地帳本已被覆寫更新")
         except Exception as e: print(f"[Error] 解析失敗: {e}")
 
     def _execute_checkAllChains(self, target, gui_mode=False):
@@ -497,14 +522,17 @@ class P2PNode:
         # 「過半」分母 = 實際存活節點 + 自己
         total_expected = len(live_peers) + 1
         
-        output_msg = f"--- 實名制共識比對 (Token 驗證) --- \n"
-        output_msg += f"預期節點: {total_expected} | 實際收到回覆: {len(all_votes)}\n"
+        output_msg = (
+            f"[共識結果]\n"
+            f"參與節點: {total_expected}\n"
+            f"收到回覆: {len(all_votes)}"
+        )
 
         # 硬門檻：存活節點（含自己）少於 MIN_QUORUM_NODES 一律拒絕共識
         if total_expected < MIN_QUORUM_NODES:
             output_msg += (
-                f"\n❌ 存活節點不足（{total_expected}/{MIN_QUORUM_NODES}），"
-                f"拒絕進行全網驗證；請等待其他節點上線。"
+                f"\n存活節點不足 ({total_expected}/{MIN_QUORUM_NODES})\n"
+                f"請等待其他節點上線"
             )
             return output_msg if gui_mode else None
 
@@ -515,7 +543,7 @@ class P2PNode:
             self.network_trusted = False
             self.network_trusted_reason = "全網均無效帳本"
             self._broadcast_distrust("全網均無效帳本", live_peers)
-            return "❌ 系統不被信任：全網均無效帳本。" if gui_mode else None
+            return (output_msg + "\n全網均無效帳本") if gui_mode else None
 
         majority_hash, max_count = valid_hashes.most_common(1)[0]
 
@@ -531,8 +559,8 @@ class P2PNode:
 
             if tampered:
                 detail = "、".join(tampered)
-                output_msg += f"\n🕵️ 偵測到帳本異常節點：{detail}"
-                self.add_log(f"[共識機制] 偵測到帳本異常節點：{detail}")
+                output_msg += f"\n異常節點: {detail}"
+                self.add_log(f"[共識] 異常節點: {detail}")
                 
             # 【關鍵】從多數派中挑一個持有正確 Hash 的節點作為修復來源
             provider_id = next(node_id for node_id, h in all_votes.items() if h == majority_hash)
@@ -542,12 +570,12 @@ class P2PNode:
             broadcast_msg = f"BROADCAST_MAJORITY:{majority_hash}:{provider_id}:{self.node_id}"
             for peer in live_peers:
                 self.sock.sendto(broadcast_msg.encode('utf-8'), peer)
-            self.add_log(f"[共識機制] 已向全網廣播修復通知（多數決 Hash: {majority_hash[:12]}... / 提供者: {provider_id}）")
+            self.add_log(f"[共識] 已廣播修復通知\n提供者: {provider_id}")
 
             # 如果連我自己都跟多數派不符，也主動發一次 REQ_SYNC 修復自己
             if my_hash != majority_hash:
-                output_msg += f"\n🔧 自我診斷：發起節點 {self.node_id} 自身帳本({'INVALID' if my_hash=='INVALID' else my_hash[:12]+'...'})與多數派不符，正在向 {provider_id} 自我修復..."
-                self.add_log(f"[自我修復] {self.node_id} 帳本異常，向 {provider_id} 請求 REQ_SYNC")
+                output_msg += f"\n本機與多數派不符\n正在向 {provider_id} 修復"
+                self.add_log(f"[同步] 本機帳本異常\n向 {provider_id} 請求修復")
 
                 if provider_id in self.nodes_contact_book:
                     self.sock.sendto(b"REQ_SYNC", self.nodes_contact_book[provider_id])
@@ -561,15 +589,15 @@ class P2PNode:
                 self.network_trusted = True
                 self.network_trusted_reason = ""
                 self._broadcast_trust(live_peers)
-                output_msg += f"\n✅ 全網達成共識 ({max_count}/{total_expected})！\n獎勵發放: 100 元 -> {target}"
+                output_msg += f"\n共識通過 ({max_count}/{total_expected})\n獎勵: 100 -> {target}"
                 self._execute_transaction("SYSTEM", target, "100")
                 # 廣播交易給所有人
                 for peer in self.peers:
                     self.sock.sendto(f"TX:SYSTEM:{target}:100".encode('utf-8'), peer)
             else:
-                output_msg += f"\n（本地帳本剛剛向 {provider_id} 完成修復，本輪不發放獎勵，下次驗證再領取。）"
+                output_msg += f"\n本機已向 {provider_id} 修復\n本輪不發放獎勵"
         else:
-            output_msg += f"\n❌ 系統不被信任：無法達成過半數共識 (僅 {max_count}/{total_expected})。"
+            output_msg += f"\n未達過半 ({max_count}/{total_expected})"
             self.network_trusted = False
             reason = f"無法達成過半數共識 ({max_count}/{total_expected})"
             self.network_trusted_reason = reason
@@ -590,7 +618,7 @@ class P2PNode:
             # --- 這是取代 'NULL' 的黃金邏輯 ---
             if res is None:
                 # 這裡主動觸發廣播（保險起見），並告訴使用者正在修復
-                raise ValueError(f"⚠️ 偵測到發送者 {sender} 的帳本異常，系統已自動發起全網同步，請在 2 秒後重試！")
+                raise ValueError(f"發送者 {sender} 帳本異常\n已發起同步，請稍後重試")
             current_balance = res
             # 3. 檢查錢夠不夠
             if int(current_balance) < int(amount):

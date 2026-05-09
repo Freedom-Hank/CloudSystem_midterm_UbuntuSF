@@ -86,7 +86,7 @@ def api_transaction():
         # 捕捉餘額不足的錯誤
         return jsonify({"status": "error", "message": str(e)}), 400
     except Exception as e:
-        print(f"🚨 系統崩潰！原因: {e}")
+        print(f"[ERROR] {e}")
         return jsonify({"status": "error", "message": "系統發生未知錯誤"}), 500
 
 @main_bp.route('/api/checkChain')

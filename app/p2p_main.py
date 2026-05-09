@@ -43,5 +43,5 @@ if __name__ == '__main__':
     app.register_blueprint(init_routes(node_instance))
     
     # 4. 啟動 Flask 控制台
-    print("🌐 啟動 Web GUI Server (Port: 5000)...")
+    print("[Web] GUI server on port 5000")
     app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
