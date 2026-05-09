@@ -110,6 +110,29 @@ class P2PNode:
                 data, addr = self.sock.recvfrom(65535)
                 message = data.decode('utf-8')
                 
+                if message.startswith("BROADCAST_DISTRUST:"):
+                    parts = message.split(":")
+                    # 格式：BROADCAST_DISTRUST:{reason}:{initiator_id}:{token}
+                    if len(parts) == 4 and parts[3] == self.network_token:
+                        reason = parts[1]
+                        initiator_id = parts[2]
+                        self.network_trusted = False
+                        self.network_trusted_reason = f"來自 {initiator_id} 的全網共識失敗通知（{reason}）"
+                        self.add_log(f"[共識機制] 🔒 收到 {initiator_id} 的凍結通知：{reason}")
+                    continue
+
+                if message.startswith("BROADCAST_TRUST:"):
+                    parts = message.split(":")
+                    # 格式：BROADCAST_TRUST:{initiator_id}:{token}
+                    if len(parts) == 3 and parts[2] == self.network_token:
+                        initiator_id = parts[1]
+                        was_frozen = not self.network_trusted
+                        self.network_trusted = True
+                        self.network_trusted_reason = ""
+                        if was_frozen:
+                            self.add_log(f"[共識機制] ✅ 收到 {initiator_id} 的全網解凍通知，本機已恢復信任。")
+                    continue
+
                 if message.startswith("PING:"):
                     parts = message.split(":")
                     if len(parts) == 3 and parts[2] == self.network_token:
@@ -337,6 +360,28 @@ class P2PNode:
         my_hash, all_votes, total_expected = self._collect_last_hash_votes()
         return self._request_sync_from_majority(my_hash, all_votes, total_expected)
 
+    def _broadcast_distrust(self, reason, live_peers):
+        """共識失敗時，通知所有存活節點同步凍結。"""
+        # 確保 reason 不含 ':' 干擾協定切分
+        safe_reason = reason.replace(":", "：")
+        msg = f"BROADCAST_DISTRUST:{safe_reason}:{self.node_id}:{self.network_token}"
+        for peer in live_peers:
+            try:
+                self.sock.sendto(msg.encode('utf-8'), peer)
+            except Exception as e:
+                print(f"[Broadcast Distrust] 發送給 {peer} 失敗: {e}")
+        self.add_log(f"[共識機制] 🔒 已向全網廣播凍結通知（{reason}）")
+
+    def _broadcast_trust(self, live_peers):
+        """共識成功且本機在多數派時，通知所有存活節點同步解凍。"""
+        msg = f"BROADCAST_TRUST:{self.node_id}:{self.network_token}"
+        for peer in live_peers:
+            try:
+                self.sock.sendto(msg.encode('utf-8'), peer)
+            except Exception as e:
+                print(f"[Broadcast Trust] 發送給 {peer} 失敗: {e}")
+        self.add_log(f"[共識機制] ✅ 已向全網廣播解凍通知")
+
     def _require_network_trust(self, action_name):
         """全網共識失敗時，凍結所有金流相關操作。回傳 (ok, msg)。"""
         if not self.network_trusted:
@@ -469,6 +514,7 @@ class P2PNode:
         if not valid_hashes:
             self.network_trusted = False
             self.network_trusted_reason = "全網均無效帳本"
+            self._broadcast_distrust("全網均無效帳本", live_peers)
             return "❌ 系統不被信任：全網均無效帳本。" if gui_mode else None
 
         majority_hash, max_count = valid_hashes.most_common(1)[0]
@@ -511,9 +557,10 @@ class P2PNode:
             time.sleep(SYNC_WAIT_SECONDS)
 
             if my_hash == majority_hash:
-                # 多數派一致 + 我也在多數派 → 解凍
+                # 多數派一致 + 我也在多數派 → 解凍 + 廣播解凍給全網
                 self.network_trusted = True
                 self.network_trusted_reason = ""
+                self._broadcast_trust(live_peers)
                 output_msg += f"\n✅ 全網達成共識 ({max_count}/{total_expected})！\n獎勵發放: 100 元 -> {target}"
                 self._execute_transaction("SYSTEM", target, "100")
                 # 廣播交易給所有人
@@ -524,7 +571,9 @@ class P2PNode:
         else:
             output_msg += f"\n❌ 系統不被信任：無法達成過半數共識 (僅 {max_count}/{total_expected})。"
             self.network_trusted = False
-            self.network_trusted_reason = f"無法達成過半數共識 ({max_count}/{total_expected})"
+            reason = f"無法達成過半數共識 ({max_count}/{total_expected})"
+            self.network_trusted_reason = reason
+            self._broadcast_distrust(reason, live_peers)
 
         if gui_mode: return output_msg
 
