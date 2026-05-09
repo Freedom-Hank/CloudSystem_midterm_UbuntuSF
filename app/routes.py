@@ -10,23 +10,55 @@ def init_routes(node):
     node_instance = node
     return main_bp
 
+# 全網節點顯示名稱對照表（routes 與 /api/peers 共用）
+NODE_NAME_MAPPING = {
+    "100.122.78.117:8001": "Node 4",
+    "100.122.78.117:8002": "Node 5",
+    "100.122.78.117:8003": "Node 6",
+    "100.94.194.29:8001": "Node 1",
+    "100.94.194.29:8002": "Node 2",
+    "100.94.194.29:8003": "Node 3",
+}
+
+
+def _display_name(ip, port):
+    return NODE_NAME_MAPPING.get(f"{ip}:{port}", f"{ip}:{port}")
+
+
 @main_bp.route('/')
-
 def index():
-    # 根據 Docker Compose 設定的 IP 自動判斷 Client 名稱
-    ip_mapping = {
-        "100.122.78.117:8001": "Node 4",
-        "100.122.78.117:8002": "Node 5",
-        "100.122.78.117:8003": "Node 6",
-
-        # VM
-        "100.94.194.29:8001": "Node 1",
-        "100.94.194.29:8002": "Node 2",
-        "100.94.194.29:8003": "Node 3"
-    }
     current_identity = f"{node_instance.ip}:{node_instance.port}"
-    node_name = ip_mapping.get(current_identity, f"Node ({current_identity})")
+    node_name = NODE_NAME_MAPPING.get(current_identity, f"Node ({current_identity})")
     return render_template("index.html", ip=current_identity, node_name=node_name)
+
+
+@main_bp.route('/api/peers')
+def api_peers():
+    peers = node_instance.get_peer_status()
+    # 自己永遠在線
+    self_entry = {
+        "node_id": node_instance.node_id,
+        "ip": node_instance.ip,
+        "port": node_instance.port,
+        "online": True,
+        "is_self": True,
+        "name": _display_name(node_instance.ip, node_instance.port),
+        "last_seen_ago": 0,
+    }
+    enriched = [self_entry]
+    for p in peers:
+        p["name"] = _display_name(p["ip"], p["port"])
+        p["is_self"] = False
+        enriched.append(p)
+    enriched.sort(key=lambda x: x["name"])
+    online_count = sum(1 for p in enriched if p["online"])
+    return jsonify({
+        "peers": enriched,
+        "online_count": online_count,
+        "total": len(enriched),
+        "network_trusted": node_instance.network_trusted,
+        "network_trusted_reason": node_instance.network_trusted_reason,
+    })
 
 @main_bp.route('/api/money/<account>')
 def api_check_money(account):

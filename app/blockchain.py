@@ -14,6 +14,15 @@ STORAGE_PATH = "/storage"
 HEAD_HASH_FILE = os.path.join(STORAGE_PATH, "latest_hash.txt")
 SYNC_WAIT_SECONDS = 2
 
+# 心跳設定：每 HEARTBEAT_INTERVAL 秒對所有 peer 發 PING；
+# 若超過 HEARTBEAT_TIMEOUT 秒沒收到回覆，視為離線。
+# interval 比 timeout 小（約 2~3 倍）以避免「燈號抖動」。
+HEARTBEAT_INTERVAL = 2
+HEARTBEAT_TIMEOUT = 5
+
+# 共識最少參與節點數（含自己）。低於此值直接拒絕全網驗證/修復。
+MIN_QUORUM_NODES = 2
+
 # ==========================================
 # P2P Node 核心類別
 # ==========================================
@@ -41,6 +50,14 @@ class P2PNode:
             self.nodes_contact_book[p_id] = (p_ip, p_port)
         self.pending_initiator = None
 
+        # 心跳狀態：peer_id -> 最後一次收到 PONG 的時間戳
+        self.peer_last_seen = {}
+        self.peer_lock = threading.Lock()
+
+        # 全網信任狀態：預設為 True，全網共識失敗時凍結；通過時恢復。
+        self.network_trusted = True
+        self.network_trusted_reason = "尚未驗證"
+
     def add_log(self, msg):
         print(msg)
         with self.log_lock:
@@ -49,6 +66,43 @@ class P2PNode:
     def start(self):
         print(f"📡 P2P Listener starting at {self.ip}:{self.port}")
         threading.Thread(target=self._listen, daemon=True).start()
+        threading.Thread(target=self._heartbeat_loop, daemon=True).start()
+
+    def _heartbeat_loop(self):
+        ping_msg = f"PING:{self.node_id}:{self.network_token}".encode('utf-8')
+        while True:
+            for peer in self.peers:
+                try:
+                    self.sock.sendto(ping_msg, peer)
+                except Exception as e:
+                    print(f"[Heartbeat] 發送 PING 給 {peer} 失敗: {e}")
+            time.sleep(HEARTBEAT_INTERVAL)
+
+    def get_live_peer_ids(self):
+        """回傳目前還在線（最後 PONG 在超時內）的 peer node_id 集合。"""
+        now = time.time()
+        with self.peer_lock:
+            return {
+                pid for pid, ts in self.peer_last_seen.items()
+                if now - ts <= HEARTBEAT_TIMEOUT
+            }
+
+    def get_peer_status(self):
+        """提供前端：每個已知 peer 的線上狀態。"""
+        now = time.time()
+        result = []
+        with self.peer_lock:
+            for pid, (p_ip, p_port) in self.nodes_contact_book.items():
+                last = self.peer_last_seen.get(pid)
+                online = last is not None and (now - last) <= HEARTBEAT_TIMEOUT
+                result.append({
+                    "node_id": pid,
+                    "ip": p_ip,
+                    "port": p_port,
+                    "online": online,
+                    "last_seen_ago": None if last is None else round(now - last, 1),
+                })
+        return result
 
     def _listen(self):
         while True:
@@ -56,6 +110,25 @@ class P2PNode:
                 data, addr = self.sock.recvfrom(65535)
                 message = data.decode('utf-8')
                 
+                if message.startswith("PING:"):
+                    parts = message.split(":")
+                    if len(parts) == 3 and parts[2] == self.network_token:
+                        sender_id = parts[1]
+                        # 收到 PING 也代表對方上線，順便更新狀態
+                        with self.peer_lock:
+                            self.peer_last_seen[sender_id] = time.time()
+                        pong = f"PONG:{self.node_id}:{self.network_token}"
+                        self.sock.sendto(pong.encode('utf-8'), addr)
+                    continue
+
+                if message.startswith("PONG:"):
+                    parts = message.split(":")
+                    if len(parts) == 3 and parts[2] == self.network_token:
+                        sender_id = parts[1]
+                        with self.peer_lock:
+                            self.peer_last_seen[sender_id] = time.time()
+                    continue
+
                 if message.startswith("TX:"):
                     parts = message.split(":")
                     if len(parts) == 4:
@@ -214,7 +287,13 @@ class P2PNode:
         self.expected_hashes.clear()
         self.awaiting_hashes = True
 
-        for peer in self.peers:
+        # 只向「目前存活」的 peer 索取 hash；通訊錄中的離線節點直接略過。
+        live_ids = self.get_live_peer_ids()
+        live_peers = [
+            self.nodes_contact_book[pid] for pid in live_ids
+            if pid in self.nodes_contact_book
+        ]
+        for peer in live_peers:
             self.sock.sendto(b"REQ_HASH", peer)
 
         my_hash = self._get_last_block_hash()
@@ -223,7 +302,8 @@ class P2PNode:
 
         all_votes = self.expected_hashes.copy()
         all_votes[self.node_id] = my_hash
-        total_expected = len(self.peers) + 1
+        # 「過半」改用實際存活的節點數（含自己）作為分母
+        total_expected = len(live_peers) + 1
         return my_hash, all_votes, total_expected
 
     def _majority_hash(self, all_votes):
@@ -233,6 +313,9 @@ class P2PNode:
         return valid_hashes.most_common(1)[0]
 
     def _request_sync_from_majority(self, my_hash, all_votes, total_expected):
+        if total_expected < MIN_QUORUM_NODES:
+            return False, f"存活節點不足（{total_expected}/{MIN_QUORUM_NODES}），無法達成共識修復。"
+
         majority_hash, max_count = self._majority_hash(all_votes)
         if not majority_hash:
             return False, "No valid peer ledger hash is available for repair."
@@ -254,8 +337,23 @@ class P2PNode:
         my_hash, all_votes, total_expected = self._collect_last_hash_votes()
         return self._request_sync_from_majority(my_hash, all_votes, total_expected)
 
+    def _require_network_trust(self, action_name):
+        """全網共識失敗時，凍結所有金流相關操作。回傳 (ok, msg)。"""
+        if not self.network_trusted:
+            msg = (
+                f"⚠️ {action_name}已凍結：上次全網共識失敗"
+                f"（原因：{self.network_trusted_reason}）。"
+                f"請重新發起全網共識驗證以恢復信任。"
+            )
+            self.add_log(msg)
+            return False, msg
+        return True, None
+
     def _execute_checkMoney(self, target, gui_mode=False):
-        
+        ok, _ = self._require_network_trust("查詢餘額")
+        if not ok:
+            return None
+
         is_valid = self._execute_checkChain()
         if not is_valid:
             # 如果帳本損毀，直接報錯或回傳 None，不進行後續計算
@@ -276,6 +374,10 @@ class P2PNode:
         return balance
 
     def _execute_checkLog(self, target, gui_mode=False):
+        ok, _ = self._require_network_trust("查詢明細")
+        if not ok:
+            return [] if gui_mode else None
+
         logs = []
         with self.file_lock:
             files = self._ledger_files_unlocked()
@@ -331,28 +433,44 @@ class P2PNode:
         self.expected_hashes.clear()
         self.awaiting_hashes = True
 
-        # 2. 發送請求給所有人 (REQ_HASH)
-        for peer in self.peers:
+        # 2. 只發送請求給「目前存活」的節點
+        live_ids = self.get_live_peer_ids()
+        live_peers = [
+            self.nodes_contact_book[pid] for pid in live_ids
+            if pid in self.nodes_contact_book
+        ]
+        for peer in live_peers:
             self.sock.sendto(b"REQ_HASH", peer)
 
         # 3. 整合選票 (包含自己的一票)
         my_hash = self._get_last_block_hash()
-        time.sleep(SYNC_WAIT_SECONDS) 
+        time.sleep(SYNC_WAIT_SECONDS)
         self.awaiting_hashes = False
-        
+
         all_votes = self.expected_hashes.copy()
         all_votes[self.node_id] = my_hash
-        total_expected = len(self.peers) + 1
+        # 「過半」分母 = 實際存活節點 + 自己
+        total_expected = len(live_peers) + 1
         
         output_msg = f"--- 實名制共識比對 (Token 驗證) --- \n"
         output_msg += f"預期節點: {total_expected} | 實際收到回覆: {len(all_votes)}\n"
+
+        # 硬門檻：存活節點（含自己）少於 MIN_QUORUM_NODES 一律拒絕共識
+        if total_expected < MIN_QUORUM_NODES:
+            output_msg += (
+                f"\n❌ 存活節點不足（{total_expected}/{MIN_QUORUM_NODES}），"
+                f"拒絕進行全網驗證；請等待其他節點上線。"
+            )
+            return output_msg if gui_mode else None
 
         # 4. 統計出現次數最多的 Hash並排除掉無效的 Hash (例如 INVALID 或 EMPTY)
         valid_hashes = Counter(h for h in all_votes.values() if h not in ["INVALID", "EMPTY"])
 
         if not valid_hashes:
+            self.network_trusted = False
+            self.network_trusted_reason = "全網均無效帳本"
             return "❌ 系統不被信任：全網均無效帳本。" if gui_mode else None
-        
+
         majority_hash, max_count = valid_hashes.most_common(1)[0]
 
         # 5. 判斷是否過半數
@@ -373,10 +491,10 @@ class P2PNode:
             # 【關鍵】從多數派中挑一個持有正確 Hash 的節點作為修復來源
             provider_id = next(node_id for node_id, h in all_votes.items() if h == majority_hash)
 
-            # 【全網修復廣播】告訴每一個節點「正確的 Hash 是什麼、該向誰要」
+            # 【全網修復廣播】告訴每一個存活節點「正確的 Hash 是什麼、該向誰要」
             # 任何本地 Hash 不符的節點（包含被竄改的 peer）會自動向 provider 請求 REQ_SYNC
             broadcast_msg = f"BROADCAST_MAJORITY:{majority_hash}:{provider_id}:{self.node_id}"
-            for peer in self.peers:
+            for peer in live_peers:
                 self.sock.sendto(broadcast_msg.encode('utf-8'), peer)
             self.add_log(f"[共識機制] 已向全網廣播修復通知（多數決 Hash: {majority_hash[:12]}... / 提供者: {provider_id}）")
 
@@ -393,6 +511,9 @@ class P2PNode:
             time.sleep(SYNC_WAIT_SECONDS)
 
             if my_hash == majority_hash:
+                # 多數派一致 + 我也在多數派 → 解凍
+                self.network_trusted = True
+                self.network_trusted_reason = ""
                 output_msg += f"\n✅ 全網達成共識 ({max_count}/{total_expected})！\n獎勵發放: 100 元 -> {target}"
                 self._execute_transaction("SYSTEM", target, "100")
                 # 廣播交易給所有人
@@ -402,10 +523,17 @@ class P2PNode:
                 output_msg += f"\n（本地帳本剛剛向 {provider_id} 完成修復，本輪不發放獎勵，下次驗證再領取。）"
         else:
             output_msg += f"\n❌ 系統不被信任：無法達成過半數共識 (僅 {max_count}/{total_expected})。"
-            
+            self.network_trusted = False
+            self.network_trusted_reason = f"無法達成過半數共識 ({max_count}/{total_expected})"
+
         if gui_mode: return output_msg
 
     def _execute_transaction(self, sender, receiver, amount):
+        # 0. SYSTEM 交易（共識成功後的獎勵）不受信任凍結影響；其餘必須通過信任檢查
+        if sender != "SYSTEM":
+            ok, msg = self._require_network_trust("交易")
+            if not ok:
+                raise ValueError(msg)
         # 1. 如果是系統發錢 (SYSTEM)，不用檢查餘額
         if sender != "SYSTEM":
             # 2. 先呼叫我們剛才寫好的 checkMoney 查一下這個人剩多少錢
