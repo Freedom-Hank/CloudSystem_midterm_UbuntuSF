@@ -17,8 +17,8 @@ SYNC_WAIT_SECONDS = 2
 # 心跳設定：每 HEARTBEAT_INTERVAL 秒對所有 peer 發 PING；
 # 若超過 HEARTBEAT_TIMEOUT 秒沒收到回覆，視為離線。
 # interval 比 timeout 小（約 2~3 倍）以避免「燈號抖動」。
-HEARTBEAT_INTERVAL = 2
-HEARTBEAT_TIMEOUT = 5
+HEARTBEAT_INTERVAL = 10
+HEARTBEAT_TIMEOUT = 60
 
 # 共識最少參與節點數（含自己）。低於此值直接拒絕全網驗證/修復。
 MIN_QUORUM_NODES = 2
