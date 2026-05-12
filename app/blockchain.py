@@ -216,7 +216,7 @@ class P2PNode:
                     self.add_log(f"[自動共識] 觸發修復: {msg}")
             except Exception as e:
                 print(f"[Auto-Consensus] error: {e}")
-            time.sleep(60)
+            time.sleep(30)
 
     def get_live_peer_ids(self):
         """回傳目前還在線（最後 PONG 在超時內）的 peer node_id 集合。"""
