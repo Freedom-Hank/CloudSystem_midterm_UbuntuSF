@@ -1,6 +1,7 @@
 #================================
 # M1421070 戴弘奕；M1429012 吳承翰  
 #================================
+from email.mime import message
 import socket
 import threading
 import os
@@ -27,27 +28,50 @@ MIN_QUORUM_NODES = 2
 # P2P Node 核心類別
 # ==========================================
 class P2PNode:
-    def __init__(self, ip, port, peers):
+    def __init__(self, ip, port, peers, peers_book=None, my_node_id=None):
+        """
+        peers       : list[(ip, port)]，給 heartbeat / TX broadcast 直接 sendto 用的「實際路由位址」。
+                      同 host 的 peer 建議改用 docker 內部主機名（client1/2/3）以避開 hairpin NAT。
+        peers_book  : dict[node_id -> (ip, port)]，給共識邏輯查詢 peer 用的「穩定身份對位址」表。
+                      key 必須等於對方在 PING/PONG/RESP_HASH 訊息裡填的 sender_id（也就是對方的 node_id）。
+                      若不提供，會 fallback 到舊版「以 ip-port 當 id」的 contact book。
+        my_node_id  : 顯式指定本機 node_id。建議跟 peers_book 的 key 同源（例如 NODE_1/NODE_2…）。
+                      未提供時 fallback 到 NODE_NAME env 或 ip-port。
+        """
         self.ip = ip
         self.port = port
         self.peers = peers
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(('0.0.0.0', self.port))
-        
+
+        # 修改 6：TCP listener，專門處理 RESP_SYNC 這類有可能超出 UDP datagram 安全大小的 payload。
+        # TCP 與 UDP 可共用同一個 port 號（不同 protocol stack）。
+        self.tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.tcp_sock.bind(('0.0.0.0', self.port))
+        self.tcp_sock.listen(8)
+
         self.file_lock = threading.Lock()
         self.expected_hashes = {}
         self.awaiting_hashes = False
-        
+
         self.log_buffer = []
         self.log_lock = threading.Lock()
 
-        self.node_id = os.environ.get("NODE_NAME", f"{ip}-{port}")
+        # node_id 優先順序：呼叫端顯式指定 > NODE_NAME env > ip-port
+        self.node_id = my_node_id or os.environ.get("NODE_NAME") or f"{ip}-{port}"
         self.network_token = "MY_BLOCKCHAIN_SECRET_2026"
 
+        # contact book：key 必須與對方在訊息裡帶的 sender_id 一致，
+        # 否則 get_live_peer_ids() 與 nodes_contact_book 對不上 → live_peers 永遠是空集合。
         self.nodes_contact_book = {}
-        for p_ip, p_port in self.peers:
-            p_id = f"{p_ip}-{p_port}"
-            self.nodes_contact_book[p_id] = (p_ip, p_port)
+        if peers_book:
+            self.nodes_contact_book = dict(peers_book)
+        else:
+            # 舊版相容：以 ip-port 當 id
+            for p_ip, p_port in self.peers:
+                p_id = f"{p_ip}-{p_port}"
+                self.nodes_contact_book[p_id] = (p_ip, p_port)
         self.pending_initiator = None
 
         # 心跳狀態：peer_id -> 最後一次收到 PONG 的時間戳
@@ -67,6 +91,12 @@ class P2PNode:
         print(f"[P2P] Listener {self.ip}:{self.port}")
         threading.Thread(target=self._listen, daemon=True).start()
         threading.Thread(target=self._heartbeat_loop, daemon=True).start()
+        # 修改 6：TCP accept loop（處理大 payload 的 RESP_SYNC）
+        threading.Thread(target=self._tcp_accept_loop, daemon=True).start()
+        # 修改 3：啟動後若本地是空帳本，主動向多數派同步一次
+        threading.Thread(target=self._bootstrap_sync, daemon=True).start()
+        # 修改 4：背景定期自我體檢，偵測到本地帳本損壞/空白就自動發起共識修復
+        threading.Thread(target=self._auto_consensus_loop, daemon=True).start()
 
     def _heartbeat_loop(self):
         ping_msg = f"PING:{self.node_id}:{self.network_token}".encode('utf-8')
@@ -77,6 +107,116 @@ class P2PNode:
                 except Exception as e:
                     print(f"[Heartbeat] 發送 PING 給 {peer} 失敗: {e}")
             time.sleep(HEARTBEAT_INTERVAL)
+
+    # ============================================================
+    # 修改 6：TCP 通道（專門承載 RESP_SYNC 這類體積偏大、不能容忍丟封包的 payload）
+    # ============================================================
+    def _tcp_accept_loop(self):
+        while True:
+            try:
+                conn, addr = self.tcp_sock.accept()
+                threading.Thread(
+                    target=self._handle_tcp_client,
+                    args=(conn, addr),
+                    daemon=True,
+                ).start()
+            except Exception as e:
+                print(f"[TCP] accept error: {e}")
+                time.sleep(1)
+
+    def _handle_tcp_client(self, conn, addr):
+        """接收對方 TCP 推送的 RESP_SYNC 整本帳本，並完成本地修復。"""
+        try:
+            conn.settimeout(15)
+            chunks = []
+            while True:
+                data = conn.recv(65536)
+                if not data:
+                    break
+                chunks.append(data)
+            payload = b"".join(chunks).decode('utf-8', errors='replace')
+
+            if payload.startswith("RESP_SYNC:"):
+                json_str = payload[len("RESP_SYNC:"):]
+                self._unpack_and_repair_ledger(json_str)
+                self.add_log(f"[同步/TCP] 本地帳本已修復完成\n來源: {addr[0]}")
+
+                # 與原本 UDP 版相同：若是被 BROADCAST_MAJORITY 引導過來的修復，
+                # 修完要回報給當初發起 checkAllChains 的節點。
+                initiator_id = getattr(self, "pending_initiator", None)
+                if initiator_id and initiator_id in self.nodes_contact_book:
+                    self.sock.sendto(
+                        f"REPAIR_DONE:{self.node_id}".encode('utf-8'),
+                        self.nodes_contact_book[initiator_id],
+                    )
+                self.pending_initiator = None
+            else:
+                self.add_log(f"[TCP] 收到未知 payload (前 16 字元: {payload[:16]!r})")
+        except Exception as e:
+            print(f"[TCP] handle from {addr} error: {e}")
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _send_ledger_via_tcp(self, target_addr):
+        """主動以 TCP 把整本帳本推送給請求修復的節點。"""
+        try:
+            ledger_data = self._pack_ledger()
+            payload = f"RESP_SYNC:{ledger_data}".encode('utf-8')
+            # target_addr 是對方的 UDP 來源 (ip, port)；本程式 TCP/UDP 共用同一 port 號
+            with socket.create_connection(target_addr, timeout=10) as s:
+                s.sendall(payload)
+                # 主動 half-close，告訴對方資料已送完
+                s.shutdown(socket.SHUT_WR)
+            self.add_log(f"[同步/TCP] 已推送帳本至 {target_addr[0]}:{target_addr[1]}")
+        except Exception as e:
+            self.add_log(f"[同步/TCP] 推送至 {target_addr} 失敗: {e}")
+
+    # ============================================================
+    # 修改 3：啟動後 bootstrap —— 若本地空帳本但有存活鄰居，主動同步一次
+    # ============================================================
+    def _bootstrap_sync(self):
+        # 等心跳跑幾輪，讓 peer_last_seen 有資料可判斷
+        time.sleep(HEARTBEAT_INTERVAL * 3 + 1)
+        try:
+            with self.file_lock:
+                files = self._ledger_files_unlocked()
+            if files:
+                # 本地已有帳本，不必 bootstrap
+                return
+            if not self.get_live_peer_ids():
+                self.add_log("[啟動] 本地空帳本但無存活鄰居\n等待後續自動共識")
+                return
+            self.add_log("[啟動] 偵測本地空帳本\n主動向多數派發起同步")
+            ok, msg = self._repair_from_majority()
+            self.add_log(f"[啟動] bootstrap 結果: {msg}")
+        except Exception as e:
+            print(f"[Bootstrap] error: {e}")
+
+    # ============================================================
+    # 修改 4：背景自我體檢 —— 定期偵測本地帳本是否損壞/落後並自動修復
+    # ============================================================
+    def _auto_consensus_loop(self):
+        # 開機後緩衝，避免和 bootstrap 撞在一起
+        time.sleep(30)
+        while True:
+            try:
+                with self.file_lock:
+                    files = self._ledger_files_unlocked()
+                    # 注意 initialize_missing_head=False：別讓這條 loop 偷偷補 latest_hash.txt，
+                    # 否則「全新節點」與「帳本曾被破壞」的判斷會被搞混。
+                    is_valid, _ = self._check_chain_unlocked(initialize_missing_head=False)
+
+                # 只在「鏈無效」或「本地空但有鄰居」時才動手；正常運作的節點不要白忙
+                needs_repair = (not is_valid) or (not files)
+                if needs_repair and self.get_live_peer_ids():
+                    ok, msg = self._repair_from_majority()
+                    self.add_log(f"[自動共識] 觸發修復: {msg}")
+            except Exception as e:
+                print(f"[Auto-Consensus] error: {e}")
+            time.sleep(60)
 
     def get_live_peer_ids(self):
         """回傳目前還在線（最後 PONG 在超時內）的 peer node_id 集合。"""
@@ -136,10 +276,8 @@ class P2PNode:
                 if message.startswith("PING:"):
                     parts = message.split(":")
                     if len(parts) == 3 and parts[2] == self.network_token:
-                        sender_id = parts[1]
-                        # 收到 PING 也代表對方上線，順便更新狀態
-                        with self.peer_lock:
-                            self.peer_last_seen[sender_id] = time.time()
+                        # 注意：不要在這裡更新 peer_last_seen，
+                        # 收到 PING 只代表單向可達，不代表我能回得去。
                         pong = f"PONG:{self.node_id}:{self.network_token}"
                         self.sock.sendto(pong.encode('utf-8'), addr)
                     continue
@@ -150,14 +288,25 @@ class P2PNode:
                         sender_id = parts[1]
                         with self.peer_lock:
                             self.peer_last_seen[sender_id] = time.time()
-                    continue
+                    continue        
 
                 if message.startswith("TX:"):
                     parts = message.split(":")
                     if len(parts) == 4:
-                        self._execute_transaction(parts[1], parts[2], parts[3])
-                        self.add_log(f"[同步] 收到交易\n{parts[1]} -> {parts[2]} ({parts[3]})")
-                    
+                        # 修改 5：原本 ValueError 會被外層 except 靜默吃掉，demo 時看不到失敗原因，
+                        # 也錯失了「我落後了」的訊號。改成顯式攔截 + 自動排程一次共識修復。
+                        try:
+                            self._execute_transaction(parts[1], parts[2], parts[3])
+                            self.add_log(f"[同步] 收到交易\n{parts[1]} -> {parts[2]} ({parts[3]})")
+                        except ValueError as e:
+                            self.add_log(
+                                f"[同步] 拒絕 TX {parts[1]}->{parts[2]}({parts[3]})\n原因: {e}"
+                            )
+                            # TX 被拒往往意味本機帳本已落後 → 背景觸發一次同步
+                            threading.Thread(
+                                target=self._repair_from_majority, daemon=True
+                            ).start()
+
                 elif message.startswith("REQ_HASH"):
                     self.add_log(f"[共識] 回應 Hash 請求 ({addr[0]})")
                     # 組合格式：RESP_HASH : [Hash] : [我的ID] : [安全Token]
@@ -206,9 +355,14 @@ class P2PNode:
                     if last_hash in ["INVALID", "EMPTY"]:
                         self.add_log(f"[同步] 拒絕 {addr[0]} 的同步請求\n本地狀態: {last_hash}")
                         continue
-                    self.add_log(f"[同步] 回應 {addr[0]} 的修復請求")
-                    ledger_data = self._pack_ledger()
-                    self.sock.sendto(f"RESP_SYNC:{ledger_data}".encode('utf-8'), addr)
+                    self.add_log(f"[同步] 回應 {addr[0]} 的修復請求 (TCP 推送)")
+                    # 修改 6：以 TCP 推送整本帳本，避免 UDP datagram 大小限制 / 分片在跨機 NAT 下被丟。
+                    # addr[1] 是對方的 UDP 監聽 port，本程式 TCP/UDP 共用同一 port 號，因此可直接連回。
+                    threading.Thread(
+                        target=self._send_ledger_via_tcp,
+                        args=(addr,),
+                        daemon=True,
+                    ).start()
 
                 elif message.startswith("RESP_SYNC:"):
                     json_str = message[len("RESP_SYNC:"):]
@@ -379,7 +533,7 @@ class P2PNode:
             return False, f"Repair provider {provider_id} is not in the contact book."
 
         self.sock.sendto(b"REQ_SYNC", self.nodes_contact_book[provider_id])
-        return True, f"{provider_id} 發起維修請求"
+        return True, f"向 {provider_id} 發起維修請求"
 
     def _repair_from_majority(self):
         my_hash, all_votes, total_expected = self._collect_last_hash_votes()
@@ -557,32 +711,47 @@ class P2PNode:
                     tag = "INVALID" if h == "INVALID" else ("EMPTY" if h == "EMPTY" else h[:12] + "...")
                     tampered.append(f"{nid}(Hash={tag})")
 
+            # provider_id 只有在有節點需要修復時才會用到；
+            # 即便如此我們也統一在這裡算好，避免下面分支重複邏輯。
+            #
+            # 自己在多數派時，直接把自己當 provider —— 符合「我發起的、我也對、就以我為準」的直覺。
+            # 否則 fallback 到任一個持有正確 hash 的 peer。
+            # （原本一律用 next()，因為 self.node_id 在 all_votes 裡被排在最後，
+            #  導致只要有任一 peer 也在多數派裡，provider 就永遠是 peer、永遠不是發起者自己。）
+            if my_hash == majority_hash:
+                provider_id = self.node_id
+            else:
+                provider_id = next(node_id for node_id, h in all_votes.items() if h == majority_hash)
+
             if tampered:
+                # ===== 有節點與多數派不一致 → 才真正廣播修復 =====
                 detail = "、".join(tampered)
                 output_msg += f"\n異常節點: {detail}"
                 self.add_log(f"[共識] 異常節點: {detail}")
-                
-            # 【關鍵】從多數派中挑一個持有正確 Hash 的節點作為修復來源
-            provider_id = next(node_id for node_id, h in all_votes.items() if h == majority_hash)
 
-            # 【全網修復廣播】告訴每一個存活節點「正確的 Hash 是什麼、該向誰要」
-            # 任何本地 Hash 不符的節點（包含被竄改的 peer）會自動向 provider 請求 REQ_SYNC
-            broadcast_msg = f"BROADCAST_MAJORITY:{majority_hash}:{provider_id}:{self.node_id}"
-            for peer in live_peers:
-                self.sock.sendto(broadcast_msg.encode('utf-8'), peer)
-            self.add_log(f"[共識] 已廣播修復通知\n提供者: {provider_id}")
+                # 全網修復廣播：告訴每一個存活節點「正確的 Hash 是什麼、該向誰要」
+                # 任何本地 Hash 不符的節點（包含被竄改的 peer）會自動向 provider 請求 REQ_SYNC
+                broadcast_msg = f"BROADCAST_MAJORITY:{majority_hash}:{provider_id}:{self.node_id}"
+                for peer in live_peers:
+                    self.sock.sendto(broadcast_msg.encode('utf-8'), peer)
+                self.add_log(f"[共識] 已廣播修復通知\n提供者: {provider_id}")
 
-            # 如果連我自己都跟多數派不符，也主動發一次 REQ_SYNC 修復自己
-            if my_hash != majority_hash:
-                output_msg += f"\n本機與多數派不符\n正在向 {provider_id} 修復"
-                self.add_log(f"[同步] 本機帳本異常\n向 {provider_id} 請求修復")
+                # 如果連我自己都跟多數派不符，也主動發一次 REQ_SYNC 修復自己
+                if my_hash != majority_hash:
+                    output_msg += f"\n本機與多數派不符\n正在向 {provider_id} 修復"
+                    self.add_log(f"[同步] 本機帳本異常\n向 {provider_id} 請求修復")
 
-                if provider_id in self.nodes_contact_book:
-                    self.sock.sendto(b"REQ_SYNC", self.nodes_contact_book[provider_id])
+                    if provider_id in self.nodes_contact_book:
+                        self.sock.sendto(b"REQ_SYNC", self.nodes_contact_book[provider_id])
 
-            # 等待所有受損節點完成 REQ_SYNC / RESP_SYNC 修復流程，再發獎勵交易，
-            # 否則 TX 廣播會在還沒修好的節點上因本地帳本無效而被拒絕。
-            time.sleep(SYNC_WAIT_SECONDS)
+                # 等待所有受損節點完成 REQ_SYNC / RESP_SYNC 修復流程，再發獎勵交易，
+                # 否則 TX 廣播會在還沒修好的節點上因本地帳本無效而被拒絕。
+                time.sleep(SYNC_WAIT_SECONDS)
+            else:
+                # ===== 全網一致 → 沒有人需要修復，不送 BROADCAST_MAJORITY、也不必 sleep =====
+                # 過去這裡會無條件 log「已廣播修復通知」，造成 3/3 全對時也被當成需要修復，
+                # 讓使用者誤以為自己壞了。改成顯式說「全網一致」。
+                self.add_log("[共識] 全網一致\n無需修復")
 
             if my_hash == majority_hash:
                 # 多數派一致 + 我也在多數派 → 解凍 + 廣播解凍給全網
@@ -595,6 +764,7 @@ class P2PNode:
                 for peer in self.peers:
                     self.sock.sendto(f"TX:SYSTEM:{target}:100".encode('utf-8'), peer)
             else:
+                # 走到這裡保證 tampered 非空（我自己就在 tampered 裡），provider_id 一定有定義
                 output_msg += f"\n本機已向 {provider_id} 修復\n本輪不發放獎勵"
         else:
             output_msg += f"\n未達過半 ({max_count}/{total_expected})"
