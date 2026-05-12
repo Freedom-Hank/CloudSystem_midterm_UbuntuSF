@@ -82,6 +82,14 @@ class P2PNode:
         self.network_trusted = True
         self.network_trusted_reason = "尚未驗證"
 
+        # 最近一次「觀測到網路上有共識活動」的時間戳。
+        # 收到 REQ_HASH / BROADCAST_MAJORITY 時更新；給 _auto_consensus_loop 當閘門用。
+        # 目的：使用者手動竄改本地 .txt 後（沒有按全網驗證）不應該被靜默自我修復——
+        #      demo 需要使用者親自按下「全網驗證」按鈕、肉眼看到修復過程。
+        # 但「網路上有人剛發起過共識、自己卻沒收到 BROADCAST/TCP 推送」這種掉包情境，
+        # 仍然要在下一輪 60 秒自我修復，所以維持時間窗口判斷。
+        self.last_consensus_observed_at = 0.0
+
     def add_log(self, msg):
         print(msg)
         with self.log_lock:
@@ -201,6 +209,9 @@ class P2PNode:
     def _auto_consensus_loop(self):
         # 開機後緩衝，避免和 bootstrap 撞在一起
         time.sleep(30)
+        # 「最近這段時間內，網路上有人剛跑過共識」的時間窗（秒）。
+        # 設成 ≥ 兩個 loop 週期（60s）較保險，這樣 worst case 兩輪內都會被當成「最近觀測到」。
+        CONSENSUS_WINDOW_SECONDS = 150
         while True:
             try:
                 with self.file_lock:
@@ -211,7 +222,19 @@ class P2PNode:
 
                 # 只在「鏈無效」或「本地空但有鄰居」時才動手；正常運作的節點不要白忙
                 needs_repair = (not is_valid) or (not files)
-                if needs_repair and self.get_live_peer_ids():
+
+                # 【閘門】只在「最近 CONSENSUS_WINDOW_SECONDS 內收到過 REQ_HASH / BROADCAST_MAJORITY」
+                # 才執行修復。也就是說：
+                #   - 使用者剛按過全網驗證 → 大家會收到 REQ_HASH → 之後 60 秒內這條 loop 會替「沒收到
+                #     BROADCAST_MAJORITY / 沒收到 TCP 推送」的壞節點補上一輪修復（UDP 掉包補救）。
+                #   - 使用者只是手動竄改某個 client 的 .txt 但沒按驗證 → 沒有人發 REQ_HASH，
+                #     last_consensus_observed_at 還停在很久以前 → 這條 loop 不動，demo 時要使用者
+                #     親自按下「全網驗證」才會看到修復過程。
+                recently_observed = (
+                    time.time() - self.last_consensus_observed_at
+                ) < CONSENSUS_WINDOW_SECONDS
+
+                if needs_repair and self.get_live_peer_ids() and recently_observed:
                     ok, msg = self._repair_from_majority()
                     self.add_log(f"[自動共識] 觸發修復: {msg}")
             except Exception as e:
@@ -308,6 +331,9 @@ class P2PNode:
                             ).start()
 
                 elif message.startswith("REQ_HASH"):
+                    # 收到 REQ_HASH 代表「網路上有人正在跑共識」——
+                    # 這是 _auto_consensus_loop 判斷「能不能自我修復」的核心訊號。
+                    self.last_consensus_observed_at = time.time()
                     self.add_log(f"[共識] 回應 Hash 請求 ({addr[0]})")
                     # 組合格式：RESP_HASH : [Hash] : [我的ID] : [安全Token]
                     response = f"RESP_HASH:{self._get_last_block_hash()}:{self.node_id}:{self.network_token}"
@@ -332,6 +358,8 @@ class P2PNode:
                                 self.expected_hashes[sender_id] = h_val
 
                 elif message.startswith("BROADCAST_MAJORITY:"):
+                    # 同上：收到 BROADCAST_MAJORITY 也代表「網路上剛剛跑過共識」。
+                    self.last_consensus_observed_at = time.time()
                     parts = message.split(":")
                     if len(parts) >= 3:
                         majority_hash = parts[1]
