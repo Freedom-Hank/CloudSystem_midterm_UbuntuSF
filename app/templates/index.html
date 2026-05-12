@@ -106,6 +106,37 @@
         .row-expense { color: var(--accent-red) !important; background: rgba(244, 63, 94, 0.1); }
         
         .btn-bold { font-weight: 700; text-transform: uppercase; padding: 8px 20px; }
+
+        /* 節點狀態面板 */
+        .peer-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+            gap: 12px;
+        }
+        .peer-pill {
+            background-color: #0f172a;
+            border: 1px solid var(--border-glow);
+            border-radius: 10px;
+            padding: 10px 14px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-family: 'JetBrains Mono', monospace;
+            transition: border-color 0.3s, box-shadow 0.3s;
+        }
+        .peer-pill.online { border-color: var(--accent-green); box-shadow: 0 0 8px rgba(16,185,129,0.25); }
+        .peer-pill.offline { opacity: 0.55; }
+        .peer-pill.self { border-color: var(--accent-cyan); box-shadow: 0 0 10px rgba(34,211,238,0.35); }
+        .peer-dot {
+            width: 10px; height: 10px; border-radius: 50%;
+            background-color: #64748b;
+            flex-shrink: 0;
+        }
+        .peer-pill.online .peer-dot { background-color: var(--accent-green); box-shadow: 0 0 8px var(--accent-green); }
+        .peer-pill.self .peer-dot { background-color: var(--accent-cyan); box-shadow: 0 0 8px var(--accent-cyan); }
+        .peer-meta { display: flex; flex-direction: column; line-height: 1.2; }
+        .peer-name { font-weight: 700; color: #f1f5f9; }
+        .peer-addr { font-size: 0.75rem; color: #94a3b8; }
     </style>
 </head>
 <body>
@@ -122,7 +153,20 @@
             <span class="stats-count" id="totalTxDisplay">0</span>
         </div>
     </div>
-    
+
+    <div class="card shadow">
+        <div class="card-header bg-dark text-white d-flex justify-content-between align-items-center">
+            <span><i class="fa-solid fa-satellite-dish me-2"></i>全網節點狀態</span>
+            <span class="d-flex align-items-center gap-3">
+                <span id="trustBadge" class="badge bg-secondary">尚未驗證</span>
+                <span class="small opacity-75">線上 <span id="peerOnlineCount">0</span> / <span id="peerTotalCount">0</span></span>
+            </span>
+        </div>
+        <div class="card-body">
+            <div class="peer-grid" id="peerGrid"></div>
+        </div>
+    </div>
+
     <div class="row">
         <div class="col-md-6">
             <div class="card shadow">
@@ -183,9 +227,40 @@
 <script>
     function logMessage(msg) {
         const logger = document.getElementById('systemLog');
-        let formattedMsg = String(msg).replace(/\\n/g, '<br>').replace(/\\\\n/g, '<br>');
+        // 後端訊息中的真實換行 (\n) 與 HTML <br> 都顯示為換行
+        const formattedMsg = String(msg).replace(/\n/g, '<br>');
         logger.innerHTML += `[${new Date().toLocaleTimeString()}] ${formattedMsg}<br>`;
         logger.scrollTop = logger.scrollHeight;
+    }
+
+    function renderPeers(payload) {
+        const grid = document.getElementById('peerGrid');
+        document.getElementById('peerOnlineCount').innerText = payload.online_count;
+        document.getElementById('peerTotalCount').innerText = payload.total;
+
+        const badge = document.getElementById('trustBadge');
+        if (payload.network_trusted) {
+            badge.className = 'badge bg-success';
+            badge.innerText = '已信任';
+            badge.title = '全網共識通過，操作已開放';
+        } else {
+            badge.className = 'badge bg-danger';
+            badge.innerText = '已凍結';
+            badge.title = `共識失敗：${payload.network_trusted_reason || '尚未驗證'}（請重新發起全網共識）`;
+        }
+
+        grid.innerHTML = payload.peers.map(p => {
+            const cls = p.is_self ? 'self' : (p.online ? 'online' : 'offline');
+            const status = p.is_self ? '本機' : (p.online ? '線上' : '離線');
+            return `
+                <div class="peer-pill ${cls}" title="${p.node_id}">
+                    <span class="peer-dot"></span>
+                    <div class="peer-meta">
+                        <span class="peer-name">${p.name}</span>
+                        <span class="peer-addr">${p.ip}:${p.port} · ${status}</span>
+                    </div>
+                </div>`;
+        }).join('');
     }
 
     // --- 自動輪詢機制 ---
@@ -201,6 +276,11 @@
             let statsData = await statsRes.json();
             document.getElementById('totalTxDisplay').innerText = statsData.total_tx;
 
+            // 3. 【新增】節點存活狀態
+            let peersRes = await fetch('/api/peers');
+            let peersData = await peersRes.json();
+            renderPeers(peersData);
+
         } catch (e) {}
     }, 1500);
 
@@ -211,7 +291,7 @@
         let data = await res.json();
         document.getElementById('queryResult').style.display = 'block';
         document.getElementById('queryResult').innerHTML = `<strong>${acc}</strong> 的餘額為: <strong>${data.balance}</strong> 元`;
-        logMessage(`查詢 ${acc} 餘額完成。`);
+        logMessage(`查詢 ${acc} 餘額完成`);
     }
 
     async function checkLog() {
@@ -265,7 +345,7 @@
             tableHtml += `</tbody></table></div>`;
             resultDiv.innerHTML = tableHtml;
         }
-        logMessage(`查詢 ${acc} 紀錄完成 (共 ${data.logs.length} 筆)。`);
+        logMessage(`查詢 ${acc} 紀錄完成 (共 ${data.logs.length} 筆)`);
     }
 
     async function sendTransaction() {
@@ -278,7 +358,7 @@
 
         // 如果輸入欄位是空的，先擋下來
         if (!data.sender || !data.receiver || !data.amount) {
-            addLog("⚠️ 請填寫完整的交易資訊", "#ffc107");
+            addLog("請填寫完整的交易資訊", "#ffc107");
             return;
         }
 
@@ -295,23 +375,22 @@
 
             // 4. 根據 HTTP 狀態碼或自定義 status 判斷結果
             if (response.ok && result.status === "success") {
-                // ✅ 交易成功 (200 OK)
-                addLog(`✅ ${result.message}: ${data.sender} -> ${data.receiver} ($${data.amount})`, "#28a745");
+                // 交易成功 (200 OK)
+                addLog(`${result.message}: ${data.sender} -> ${data.receiver} ($${data.amount})`, "#28a745");
                 // 如果「付款人」正好是目前查詢的帳戶，就自動刷新餘額；否則什麼都不做
                 const queryAcc = document.getElementById('queryAccount').value.trim();
                 if (queryAcc && (queryAcc === data.sender || queryAcc === data.receiver)) {
                     checkMoney();
                 }
             } else {
-                // ❌ 邏輯錯誤 (例如 400 餘額不足)
-                addLog(`❌ 交易失敗: ${result.message}`, "#dc3545");
+                // 邏輯錯誤 (例如 400 餘額不足)
+                addLog(`交易失敗: ${result.message}`, "#dc3545");
             }
 
         } catch (error) {
-            // 🛠️ 系統崩潰或網路斷線
+            // 系統崩潰或網路斷線
             console.error("發生錯誤:", error);
-            // 把真實錯誤訊息印出來，別再騙自己是「無法連線」
-            addLog(`🚨 系統異常: ${error.name} - ${error.message}`, "#ffc107");
+            addLog(`系統異常: ${error.name} - ${error.message}`, "#ffc107");
         }
     }
 
@@ -335,7 +414,7 @@
     async function checkAllChains() {
         const target = document.getElementById('rewardAccount').value;
         if(!target) return alert('請輸入要接收獎勵的帳戶');
-        logMessage('🚀 發起全網共識比對中，請稍候...');
+        logMessage('發起全網共識比對中...');
         
         let res = await fetch(`/api/checkAllChains/${target}`);
         let data = await res.json();

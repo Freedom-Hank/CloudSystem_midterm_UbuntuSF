@@ -10,23 +10,61 @@ def init_routes(node):
     node_instance = node
     return main_bp
 
+# 全網節點顯示名稱對照表（key = node_id，與 P2PNode.node_id / NODE_NAME 同源）
+# 同 host peer 的 ip 欄位現在會是 docker 服務名（client1/2/3），不再是 Tailscale IP，
+# 因此改用穩定的 node_id 來查顯示名，避免內外位址表示不一致時對不上。
+NODE_NAME_MAPPING = {
+    "NODE_1": "Node 1",
+    "NODE_2": "Node 2",
+    "NODE_3": "Node 3",
+    "NODE_4": "Node 4",
+    "NODE_5": "Node 5",
+    "NODE_6": "Node 6",
+}
+
+
+def _display_name_by_id(node_id, fallback_ip=None, fallback_port=None):
+    if node_id in NODE_NAME_MAPPING:
+        return NODE_NAME_MAPPING[node_id]
+    if fallback_ip is not None and fallback_port is not None:
+        return f"{fallback_ip}:{fallback_port}"
+    return node_id
+
+
 @main_bp.route('/')
-
 def index():
-    # 根據 Docker Compose 設定的 IP 自動判斷 Client 名稱
-    ip_mapping = {
-        "100.122.78.117:8001": "Node 4",
-        "100.122.78.117:8002": "Node 5",
-        "100.122.78.117:8003": "Node 6",
-
-        # VM
-        "100.94.194.29:8001": "Node 1",
-        "100.94.194.29:8002": "Node 2",
-        "100.94.194.29:8003": "Node 3"
-    }
     current_identity = f"{node_instance.ip}:{node_instance.port}"
-    node_name = ip_mapping.get(current_identity, f"Node ({current_identity})")
+    node_name = _display_name_by_id(node_instance.node_id, node_instance.ip, node_instance.port)
     return render_template("index.html", ip=current_identity, node_name=node_name)
+
+
+@main_bp.route('/api/peers')
+def api_peers():
+    peers = node_instance.get_peer_status()
+    # 自己永遠在線
+    self_entry = {
+        "node_id": node_instance.node_id,
+        "ip": node_instance.ip,
+        "port": node_instance.port,
+        "online": True,
+        "is_self": True,
+        "name": _display_name_by_id(node_instance.node_id, node_instance.ip, node_instance.port),
+        "last_seen_ago": 0,
+    }
+    enriched = [self_entry]
+    for p in peers:
+        p["name"] = _display_name_by_id(p["node_id"], p["ip"], p["port"])
+        p["is_self"] = False
+        enriched.append(p)
+    enriched.sort(key=lambda x: x["name"])
+    online_count = sum(1 for p in enriched if p["online"])
+    return jsonify({
+        "peers": enriched,
+        "online_count": online_count,
+        "total": len(enriched),
+        "network_trusted": node_instance.network_trusted,
+        "network_trusted_reason": node_instance.network_trusted_reason,
+    })
 
 @main_bp.route('/api/money/<account>')
 def api_check_money(account):
@@ -54,7 +92,7 @@ def api_transaction():
         # 捕捉餘額不足的錯誤
         return jsonify({"status": "error", "message": str(e)}), 400
     except Exception as e:
-        print(f"🚨 系統崩潰！原因: {e}")
+        print(f"[ERROR] {e}")
         return jsonify({"status": "error", "message": "系統發生未知錯誤"}), 500
 
 @main_bp.route('/api/checkChain')

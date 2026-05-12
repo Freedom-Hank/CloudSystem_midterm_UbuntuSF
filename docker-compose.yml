@@ -14,6 +14,7 @@ services:
     <<: *client-base
     container_name: client1
     environment:
+      - NODE_NAME=NODE_1
       - MY_P2P_PORT=8001
     volumes:
       - ./storage/client1:/storage
@@ -21,6 +22,7 @@ services:
     ports:
       - "8081:5000"
       - "8001:8001/udp"
+      - "8001:8001/tcp"   # 修改 6：給 RESP_SYNC 走 TCP 用
     networks:
       p2p_net:
         ipv4_address: 172.18.0.2
@@ -29,6 +31,7 @@ services:
     <<: *client-base
     container_name: client2
     environment:
+      - NODE_NAME=NODE_2
       - MY_P2P_PORT=8002
     volumes:
       - ./storage/client2:/storage
@@ -36,6 +39,7 @@ services:
     ports:
       - "8082:5000"
       - "8002:8002/udp"
+      - "8002:8002/tcp"   # 修改 6
     networks:
       p2p_net:
         ipv4_address: 172.18.0.3
@@ -44,6 +48,7 @@ services:
     <<: *client-base
     container_name: client3
     environment:
+      - NODE_NAME=NODE_3
       - MY_P2P_PORT=8003
     volumes:
       - ./storage/client3:/storage
@@ -51,6 +56,7 @@ services:
     ports:
       - "8083:5000"
       - "8003:8003/udp"
+      - "8003:8003/tcp"   # 修改 6
     networks:
       p2p_net:
         ipv4_address: 172.18.0.4
