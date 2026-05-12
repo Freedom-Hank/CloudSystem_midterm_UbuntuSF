@@ -18,8 +18,8 @@ SYNC_WAIT_SECONDS = 2
 # 心跳設定：每 HEARTBEAT_INTERVAL 秒對所有 peer 發 PING；
 # 若超過 HEARTBEAT_TIMEOUT 秒沒收到回覆，視為離線。
 # interval 比 timeout 小（約 2~3 倍）以避免「燈號抖動」。
-HEARTBEAT_INTERVAL = 10
-HEARTBEAT_TIMEOUT = 60
+HEARTBEAT_INTERVAL = 2
+HEARTBEAT_TIMEOUT = 8
 
 # 共識最少參與節點數（含自己）。低於此值直接拒絕全網驗證/修復。
 MIN_QUORUM_NODES = 2
@@ -704,53 +704,71 @@ class P2PNode:
         # 5. 判斷是否過半數
         if max_count > total_expected / 2:
 
-            # 找出所有「實名制」回報但與多數派不一致的節點
-            tampered = []
+            # 找出所有「實名制」回報但與多數派不一致的節點。
+            # 同時保留兩份：display（給使用者看）與 raw node_id（直接推送 TCP 用）。
+            tampered_display = []
+            tampered_node_ids = []
             for nid, h in all_votes.items():
                 if h != majority_hash:
                     tag = "INVALID" if h == "INVALID" else ("EMPTY" if h == "EMPTY" else h[:12] + "...")
-                    tampered.append(f"{nid}(Hash={tag})")
+                    tampered_display.append(f"{nid}(Hash={tag})")
+                    tampered_node_ids.append(nid)
 
             # provider_id 只有在有節點需要修復時才會用到；
-            # 即便如此我們也統一在這裡算好，避免下面分支重複邏輯。
-            #
-            # 自己在多數派時，直接把自己當 provider —— 符合「我發起的、我也對、就以我為準」的直覺。
-            # 否則 fallback 到任一個持有正確 hash 的 peer。
-            # （原本一律用 next()，因為 self.node_id 在 all_votes 裡被排在最後，
-            #  導致只要有任一 peer 也在多數派裡，provider 就永遠是 peer、永遠不是發起者自己。）
+            # 自己在多數派時直接把自己當 provider（符合「我發起的、我也對、就以我為準」）。
             if my_hash == majority_hash:
                 provider_id = self.node_id
             else:
                 provider_id = next(node_id for node_id, h in all_votes.items() if h == majority_hash)
 
-            if tampered:
-                # ===== 有節點與多數派不一致 → 才真正廣播修復 =====
-                detail = "、".join(tampered)
+            if tampered_display:
+                detail = "、".join(tampered_display)
                 output_msg += f"\n異常節點: {detail}"
                 self.add_log(f"[共識] 異常節點: {detail}")
 
-                # 全網修復廣播：告訴每一個存活節點「正確的 Hash 是什麼、該向誰要」
-                # 任何本地 Hash 不符的節點（包含被竄改的 peer）會自動向 provider 請求 REQ_SYNC
-                broadcast_msg = f"BROADCAST_MAJORITY:{majority_hash}:{provider_id}:{self.node_id}"
-                for peer in live_peers:
-                    self.sock.sendto(broadcast_msg.encode('utf-8'), peer)
-                self.add_log(f"[共識] 已廣播修復通知\n提供者: {provider_id}")
+                if my_hash == majority_hash:
+                    # ========================================================
+                    # 【快速路徑】我自己就是 provider，手上就有正確資料。
+                    # 跳過 BROADCAST_MAJORITY (UDP) → REQ_SYNC (UDP) 這條兩段 UDP 的迂迴，
+                    # 直接平行 TCP 推送整本帳本給每個 tampered peer。
+                    # 跨機環境下省掉 2 段可能掉包的 UDP，整輪從 4~5 秒縮短到 1~2 秒，
+                    # 且 TCP 本身有重傳，可靠性遠高於 UDP。
+                    # 若推送失敗，下一輪 _auto_consensus_loop 仍會接手，安全。
+                    # ========================================================
+                    push_count = 0
+                    for nid in tampered_node_ids:
+                        if nid in self.nodes_contact_book:
+                            target_addr = self.nodes_contact_book[nid]
+                            self.add_log(f"[共識] 直接推送帳本給 {nid}")
+                            threading.Thread(
+                                target=self._send_ledger_via_tcp,
+                                args=(target_addr,),
+                                daemon=True,
+                            ).start()
+                            push_count += 1
+                        else:
+                            self.add_log(f"[共識] 找不到 {nid} 的位址，跳過")
+                    output_msg += f"\n已直接推送帳本給 {push_count} 個節點"
+                else:
+                    # ========================================================
+                    # 【慢速路徑】我自己也壞了，沒有正確資料可推；
+                    # 改走原本的廣播：通知所有 peer 去 provider 那邊要、自己也發 REQ_SYNC。
+                    # ========================================================
+                    broadcast_msg = f"BROADCAST_MAJORITY:{majority_hash}:{provider_id}:{self.node_id}"
+                    for peer in live_peers:
+                        self.sock.sendto(broadcast_msg.encode('utf-8'), peer)
+                    self.add_log(f"[共識] 已廣播修復通知\n提供者: {provider_id}")
 
-                # 如果連我自己都跟多數派不符，也主動發一次 REQ_SYNC 修復自己
-                if my_hash != majority_hash:
                     output_msg += f"\n本機與多數派不符\n正在向 {provider_id} 修復"
                     self.add_log(f"[同步] 本機帳本異常\n向 {provider_id} 請求修復")
-
                     if provider_id in self.nodes_contact_book:
                         self.sock.sendto(b"REQ_SYNC", self.nodes_contact_book[provider_id])
 
-                # 等待所有受損節點完成 REQ_SYNC / RESP_SYNC 修復流程，再發獎勵交易，
-                # 否則 TX 廣播會在還沒修好的節點上因本地帳本無效而被拒絕。
+                # 等待 TCP 推送 / REQ_SYNC-RESP_SYNC 完成，再廣播獎勵交易，
+                # 否則 TX 會在還沒修好的節點上因本地帳本無效而被拒絕。
                 time.sleep(SYNC_WAIT_SECONDS)
             else:
                 # ===== 全網一致 → 沒有人需要修復，不送 BROADCAST_MAJORITY、也不必 sleep =====
-                # 過去這裡會無條件 log「已廣播修復通知」，造成 3/3 全對時也被當成需要修復，
-                # 讓使用者誤以為自己壞了。改成顯式說「全網一致」。
                 self.add_log("[共識] 全網一致\n無需修復")
 
             if my_hash == majority_hash:
